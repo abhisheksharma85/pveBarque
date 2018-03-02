@@ -1,11 +1,11 @@
 from flask import Flask, request
 from flask_restful import Resource, Api, reqparse, abort
-from json import dumps
+from json import dumps,loads
 from flask_jsonpify import jsonify
 from datetime import datetime
 from shutil import copyfile
 from glob import glob
-import subprocess, os, time
+import subprocess, os, time, json
 
 #defaults
 __host = "192.168.100.11"
@@ -41,16 +41,59 @@ class Backup(Resource):
 		dest = "".join([path, vmdisk, timestamp, ".img"])
 		args = ['rbd export --export-format 1 {} {}'.format(vmdisk, dest)]
 		cmd = subprocess.check_output(args, shell=True)#.split('\n') #run command then convert output to list, splitting on newline
-		return {'Backup file': dest, 'Config file': config_dest}, 201
+		return {'Backup file': os.path.basename(dest), 'Config file': os.path.basename(config_dest)}, 201
 class Restore(Resource):
 	def post(self,vmid):
+		fileimg = ""
+		fileconf = ""
+		node = ""
+		config_file = ""
+		vmdisk = 'vm-{}-disk-1'.format(vmid)
+		#check if backup and config files exist
+		if 'file' in request.args:
+			response = ""
+			print(request.args['file'])
+			filename = os.path.splitext(request.args['file'])[0]
+			print(filename)
+			fileimg = "".join([path, filename, ".img"])
+			fileconf = "".join([path, filename, ".conf"])
+			if not os.path.isfile(fileimg) and not os.path.isfile(fileconf):
+				return {'error': "unable to proceed, backup file or config file (or both) does not exist"}, 400
+		else:
+			return "resource requires a file argument", 400
 		#find node hosting container
 		config_target = "{}.conf".format(vmid)
 		for paths, dirs, files in os.walk('/etc/pve/nodes'):
 			if config_target in files:
 				config_file = os.path.join(paths, config_target)
-				pathlist = os.path.split(config_file)
-				print(pathlist)
+				node = config_file.split('/')[4]
+				print(node)
+		#stop container if not already stopped
+		if not loads(subprocess.check_output("pvesh get /nodes/{}/lxc/{}/status/current".format(node,vmid), shell=True))["status"] == "stopped":
+			ctstop = subprocess.check_output("pvesh create /nodes/{}/lxc/{}/status/stop".format(node, vmid), shell=True)
+		timeout = time.time() + 60
+		while True: #wait for container to stop
+			stat = loads(subprocess.check_output("pvesh get /nodes/{}/lxc/{}/status/current".format(node,vmid), shell=True))["status"]
+			print(stat)
+			if stat == "stopped":
+				break
+			elif time.time() > timeout:
+				return "timeout - unable to stop container", 500
+		#delete container storage
+		imgdel = subprocess.check_output("pvesh delete /nodes/{}/storage/rbd_ct/content/rbd_ct:{}".format(node, vmdisk), shell=True)
+		print(imgdel)
+		#import new image
+		rbdimp = subprocess.check_output("rbd import {} {}".format(fileimg, vmdisk), shell=True)
+		print(rbdimp)
+		#image attenuation for kernel params
+		imgatten = subprocess.check_output("rbd feature disable {} object-map fast-diff deep-flatten".format(vmdisk), shell=True)
+		print(imgatten)
+		#replace config file
+		copyfile(fileconf, config_file)
+		#start container
+		ctstart = subprocess.check_output("pvesh create /nodes/{}/lxc/{}/status/start".format(node,vmid), shell=True)
+		time.sleep(5)
+		print(ctstart)
 class ListAllBackups(Resource):
 	def get(self):
 		result = []
@@ -71,11 +114,15 @@ class DeleteBackup(Resource):
 	def post(self,vmid):
 		if 'file' in request.args:
 			print(request.args['file'])
-			fullpath = "".join([path, request.args['file']])
-			if os.path.isfile(fullpath):
-				return {'file exists': fullpath}
+			fileimg = "".join([path, request.args['file']])
+			fileconf = "".join([os.path.splitext(fileimg)[0],".conf"])
+			if os.path.isfile(fileimg):
+				os.remove(fileimg)
+				if os.path.isfile(fileconf):
+					os.remove(fileconf)
+				return {'file removed': os.path.basename(fileimg)}
 			else:
-				return {'file does not exist': fullpath}
+				return {'file does not exist': os.path.basename(fileimg)}
 		else:
 			return "resource requires a file argument", 400
 		
